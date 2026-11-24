@@ -41,6 +41,7 @@ struct ProcGroup: Identifiable {
     var bytes: UInt64
     var pids: [Int32]
     var isApp: Bool = false
+    var appPath: String? = nil
 }
 
 @discardableResult
@@ -72,7 +73,9 @@ func readProcGroups() -> [ProcGroup] {
         guard f.count == 3, let pid = Int32(f[0]), let kb = UInt64(f[1]) else { continue }
         let path = String(f[2])
         let name = groupName(path)
-        var g = map[name] ?? ProcGroup(id: name, name: name, bytes: 0, pids: [], isApp: path.contains(".app/") && !path.contains("/claude-code/"))
+        var appPath: String? = nil
+        if !path.contains("/claude-code/"), let r = path.range(of: ".app/") { appPath = String(path[..<r.lowerBound]) + ".app" }
+        var g = map[name] ?? ProcGroup(id: name, name: name, bytes: 0, pids: [], isApp: appPath != nil, appPath: appPath)
         g.bytes += kb * 1024
         g.pids.append(pid)
         map[name] = g
