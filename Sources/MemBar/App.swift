@@ -717,6 +717,7 @@ struct ChromeView: View {
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .onAppear { model.refreshTabs() }
+        .onChange(of: model.panelOpen) { _, open in if open { model.refreshTabs() } }
     }
 }
 
@@ -885,6 +886,13 @@ struct DiskView: View {
                 }
             }
             if let m = model.diskMessage { Text(m).font(.caption2).foregroundStyle(.orange) }
+        }
+        // The panel is kept alive between openings, so onAppear only fires once. Rescan every time it opens.
+        .onChange(of: model.panelOpen) { _, open in
+            if open && !model.diskScanning && model.mem.pressure < 0.92
+                && Date().timeIntervalSince(model.diskScanAt ?? .distantPast) > 20 {
+                model.scanDisk()
+            }
         }
         .onAppear {
             if model.diskItems.isEmpty && !model.diskScanning {
