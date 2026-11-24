@@ -23,7 +23,8 @@ func listDir(_ parent: String) -> [DiskItem] {
     var items: [DiskItem] = []
     var seen = Set<String>()
     // macOS du cannot combine -a with -d, so folders come from du...
-    let out = run("/usr/bin/du", ["-k", "-d", "1", parent])
+    // Skip media libraries: touching them makes macOS ask for Photos/Music access over and over.
+    let out = run("/usr/bin/du", ["-k", "-d", "1", "-I", "*.photoslibrary", "-I", "*.musiclibrary", "-I", "*.tvlibrary", parent])
     for line in out.split(separator: "\n") {
         let f = line.split(separator: "\t", maxSplits: 1)
         guard f.count == 2, let kb = UInt64(f[0]) else { continue }
