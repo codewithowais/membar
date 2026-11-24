@@ -58,7 +58,8 @@ struct GlassGroup<Content: View>: View {
 
 // MARK: - Animated backdrop
 
-/// Slow drifting colour blobs behind the glass, so the glass has something to refract.
+/// Slow drifting colour glows behind the glass, so the glass has something to refract.
+/// Drawn as radial gradients on one Canvas that fills the whole panel (no blur, so no hard edges).
 /// Runs at 20 fps and only while the panel is on screen, so it stays cheap.
 struct AuroraBackground: View {
     let colors: [Color]
@@ -66,18 +67,20 @@ struct AuroraBackground: View {
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 20)) { ctx in
             let t = ctx.date.timeIntervalSinceReferenceDate
-            ZStack {
-                blob(colors[0], size: 280, x: sin(t / 3.1) * 90 - 80, y: cos(t / 4.2) * 70 - 120)
-                blob(colors[1], size: 260, x: cos(t / 3.7) * 100 + 90, y: sin(t / 2.9) * 80 + 40)
-                blob(colors[2], size: 240, x: sin(t / 4.6 + 1) * 90 - 20, y: cos(t / 3.3) * 70 + 170)
+            Canvas { gc, size in
+                let w = size.width, h = size.height
+                glow(&gc, colors[0], x: w * 0.25 + sin(t / 3.1) * w * 0.18, y: h * 0.18 + cos(t / 4.2) * h * 0.10, r: w * 0.75)
+                glow(&gc, colors[1], x: w * 0.80 + cos(t / 3.7) * w * 0.16, y: h * 0.52 + sin(t / 2.9) * h * 0.12, r: w * 0.70)
+                glow(&gc, colors[2], x: w * 0.40 + sin(t / 4.6 + 1) * w * 0.20, y: h * 0.90 + cos(t / 3.3) * h * 0.07, r: w * 0.75)
             }
         }
-        .animation(.easeInOut(duration: 0.9), value: colors.map { "\($0)" })
-        .clipped()
     }
 
-    private func blob(_ c: Color, size: CGFloat, x: CGFloat, y: CGFloat) -> some View {
-        Circle().fill(c.opacity(0.55)).frame(width: size, height: size).blur(radius: 55).offset(x: x, y: y)
+    private func glow(_ gc: inout GraphicsContext, _ c: Color, x: CGFloat, y: CGFloat, r: CGFloat) {
+        let rect = CGRect(x: x - r, y: y - r, width: r * 2, height: r * 2)
+        gc.fill(Path(ellipseIn: rect),
+                with: .radialGradient(Gradient(colors: [c.opacity(0.55), c.opacity(0.0)]),
+                                      center: CGPoint(x: x, y: y), startRadius: 0, endRadius: r))
     }
 }
 
