@@ -4,7 +4,10 @@ import SwiftUI
 struct MemBarApp: App {
     @StateObject private var model = Model()
 
-    init() { DebugLog.install() }
+    init() {
+        setpriority(PRIO_PROCESS, 0, 10)   // lower CPU priority than the apps you are using
+        DebugLog.install()
+    }
 
     var body: some Scene {
         MenuBarExtra {
@@ -63,9 +66,10 @@ struct GlassGroup<Content: View>: View {
 /// Runs at 20 fps and only while the panel is on screen, so it stays cheap.
 struct AuroraBackground: View {
     let colors: [Color]
+    var active = true
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 20)) { ctx in
+        TimelineView(.animation(minimumInterval: 1.0 / 12, paused: !active)) { ctx in
             let t = ctx.date.timeIntervalSinceReferenceDate
             Canvas { gc, size in
                 let w = size.width, h = size.height
@@ -263,8 +267,6 @@ struct SectionHeader: View {
 
 struct SkeletonRows: View {
     let count: Int
-    @State private var on = false
-
     var body: some View {
         VStack(spacing: 14) {
             ForEach(0..<count, id: \.self) { i in
@@ -277,12 +279,11 @@ struct SkeletonRows: View {
                     Spacer()
                     Capsule().frame(width: 52, height: 10)
                 }
-                .foregroundStyle(Color.primary.opacity(on ? 0.16 : 0.06))
+                .foregroundStyle(Color.primary.opacity(0.10))
             }
         }
         .padding(.horizontal, 10)
         .padding(.top, 6)
-        .onAppear { withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { on = true } }
     }
 }
 
@@ -386,6 +387,14 @@ struct ContentView: View {
     @AppStorage("membar.tab") private var tabRaw: String = Tab.memory.rawValue
     var tab: Tab { Tab(rawValue: tabRaw) ?? .memory }
 
+    /// Calm mode: no animated backdrop when the Mac is short on memory, in Low Power Mode, or with Reduce Motion on.
+    var calm: Bool {
+        model.mem.pressure > 0.85
+            || ProcessInfo.processInfo.isLowPowerModeEnabled
+            || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            || UserDefaults.standard.bool(forKey: "membar.static")
+    }
+
     var auroraColors: [Color] {
         switch tab {
         case .memory: return [.blue, .purple, levelColor(model.mem.pressure)]
@@ -397,7 +406,7 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            AuroraBackground(colors: auroraColors)
+            AuroraBackground(colors: auroraColors, active: model.panelOpen && !calm)
             VStack(spacing: 12) {
                 GlassTabBar(tab: Binding(get: { tab }, set: { tabRaw = $0.rawValue }))
                 Group {
@@ -867,7 +876,7 @@ struct DiskView: View {
             if let m = model.diskMessage { Text(m).font(.caption2).foregroundStyle(.orange) }
         }
         .onAppear {
-            if !model.diskScanning && (model.diskItems.isEmpty || Date().timeIntervalSince(model.diskScanAt ?? .distantPast) > 120) {
+            if !model.diskScanning && model.mem.pressure < 0.92 && (model.diskItems.isEmpty || Date().timeIntervalSince(model.diskScanAt ?? .distantPast) > 120) {
                 model.scanDisk()
             }
         }

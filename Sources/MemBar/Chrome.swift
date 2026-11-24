@@ -14,6 +14,21 @@ struct ChromeTab: Identifiable {
     var shared: Int = 1         // how many tabs share that process
     var measured = false
 
+    /// The favicon comes from a page via a tab-suspender URL, so treat it as untrusted:
+    /// only known image types, a small size cap, and it must decode to a sane, small image.
+    static func safeFavicon(_ dataURI: String) -> NSImage? {
+        let allowed = ["data:image/png;base64,", "data:image/jpeg;base64,", "data:image/gif;base64,",
+                       "data:image/x-icon;base64,", "data:image/vnd.microsoft.icon;base64,", "data:image/webp;base64,"]
+        guard let prefix = allowed.first(where: { dataURI.hasPrefix($0) }) else { return nil }
+        let b64 = dataURI.dropFirst(prefix.count)
+        guard b64.count <= 90_000,                      // about 64 KB decoded
+              let d = Data(base64Encoded: String(b64)), d.count <= 66_000,
+              let img = NSImage(data: d), img.isValid,
+              img.size.width > 0, img.size.height > 0, img.size.width <= 512, img.size.height <= 512
+        else { return nil }
+        return img
+    }
+
     init(id: String, windowID: String, tabID: String, title: String, url rawURL: String) {
         self.id = id; self.windowID = windowID; self.tabID = tabID; self.title = title
         var real = rawURL
@@ -21,9 +36,7 @@ struct ChromeTab: Identifiable {
         // Tab-suspender extensions park tabs on chrome-extension://…/park.html?url=<real url>&icon=<data uri>
         if rawURL.hasPrefix("chrome-extension://"), let c = URLComponents(string: rawURL) {
             if let u = c.queryItems?.first(where: { $0.name == "url" })?.value { real = u }
-            if let i = c.queryItems?.first(where: { $0.name == "icon" })?.value,
-               let r = i.range(of: "base64,"),
-               let d = Data(base64Encoded: String(i[r.upperBound...])) { icon = NSImage(data: d) }
+            if let i = c.queryItems?.first(where: { $0.name == "icon" })?.value { icon = ChromeTab.safeFavicon(i) }
         }
         self.url = real
         self.host = URL(string: real)?.host ?? real
@@ -69,6 +82,7 @@ func measureChromeTabs(_ input: [ChromeTab]) -> (tabs: [ChromeTab], error: Strin
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
     p.arguments = ["-e", script]
+    p.qualityOfService = .utility
     let o = Pipe(), e = Pipe()
     p.standardOutput = o; p.standardError = e
     do { try p.run() } catch { return (input, "Could not run osascript.") }
@@ -145,6 +159,7 @@ func fetchChromeTabs() -> (tabs: [ChromeTab], error: String?) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
     p.arguments = ["-e", script]
+    p.qualityOfService = .utility
     let o = Pipe(), e = Pipe()
     p.standardOutput = o; p.standardError = e
     do { try p.run() } catch { return ([], "Could not run osascript.") }

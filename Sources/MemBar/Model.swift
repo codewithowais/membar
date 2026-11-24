@@ -4,29 +4,66 @@ import AppKit
 @MainActor
 final class Model: ObservableObject {
     @Published var mem = MemInfo()
-    @Published var memHistory: [Double] = []
     @Published var groups: [ProcGroup] = []
     @Published var tabs: [ChromeTab] = []
     @Published var tabsError: String? = nil
     @Published var items: [CleanItem] = defaultCleanItems()
     @Published var scanning = false
     @Published var lastFreed: UInt64? = nil
+    /// True while the panel is open (MemBar is the active app). Everything heavy is gated on this.
+    @Published var panelOpen = false
+
+    /// Not @Published on purpose: appending to it must not re-render the UI while the panel is closed.
+    var memHistory: [Double] = []
 
     private var timer: Timer?
 
     init() {
-        refresh()
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.panelOpen = true; self?.refresh() }
+        }
+        nc.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.panelOpen = false }
+        }
+        // Belt and braces: the panel is also "open" whenever one of our own windows is key.
+        nc.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { [weak self] n in
+            let cls = (n.object as? NSWindow)?.className ?? ""
+            guard !cls.contains("StatusBar"), !cls.contains("TUI") else { return }
+            Task { @MainActor in self?.panelOpen = true; self?.refresh() }
+        }
+        nc.addObserver(forName: NSWindow.didResignKeyNotification, object: nil, queue: .main) { [weak self] n in
+            let cls = (n.object as? NSWindow)?.className ?? ""
+            guard !cls.contains("StatusBar"), !cls.contains("TUI") else { return }
+            Task { @MainActor in self?.panelOpen = false }
+        }
+        sampleMemory()
         timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
+        timer?.tolerance = 2   // lets macOS batch our wake-ups with others
+    }
+
+    /// Cheap (a couple of syscalls, no process spawned). Runs always, to feed the menu bar number and the graph.
+    private func sampleMemory() {
+        let m = readMemory()
+        memHistory.append(m.pressure)
+        if memHistory.count > 90 { memHistory.removeFirst() }
+        // With the panel closed, only republish when the menu bar text (0.1 GB steps) would change.
+        let step: UInt64 = 107_374_182
+        if panelOpen || m.used / step != mem.used / step { mem = m }
+        else if panelOpen == false { /* keep the old value, nothing on screen to update */ }
     }
 
     func refresh() {
-        Task.detached {
-            let m = readMemory()
+        sampleMemory()
+        // If we somehow missed an "opened" event, a key window or active app still means the panel is showing.
+        if !panelOpen && (NSApp.isActive || NSApp.keyWindow != nil) { panelOpen = true }
+        guard panelOpen else { return }
+        Task.detached(priority: .utility) {
             let g = readProcGroups()
             let d = readDisk()
-            await MainActor.run { self.mem = m; self.groups = g; self.memHistory.append(m.pressure); if self.memHistory.count > 90 { self.memHistory.removeFirst() }; self.diskTotal = d.total; self.diskAvail = d.avail }
+            await MainActor.run { self.groups = g; self.diskTotal = d.total; self.diskAvail = d.avail }
         }
     }
 

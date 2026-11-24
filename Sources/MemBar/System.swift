@@ -49,6 +49,7 @@ func run(_ path: String, _ args: [String]) -> String {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
+    p.qualityOfService = .background   // never compete with the apps you are using
     let pipe = Pipe()
     p.standardOutput = pipe
     p.standardError = Pipe()
@@ -65,18 +66,31 @@ func groupName(_ path: String) -> String {
     return parts.last ?? path
 }
 
+/// Lists your processes straight from the kernel (no `ps` process is spawned, which matters most
+/// when the Mac is short on memory) and groups them by app.
 func readProcGroups() -> [ProcGroup] {
-    let out = run("/bin/ps", ["-U", String(getuid()), "-o", "pid=,rss=,comm="])
+    let uid = getuid()
+    var pids = [pid_t](repeating: 0, count: 4096)
+    let n = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size)))
+    guard n > 0 else { return [] }
+    var pathBuf = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
     var map: [String: ProcGroup] = [:]
-    for line in out.split(separator: "\n") {
-        let f = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
-        guard f.count == 3, let pid = Int32(f[0]), let kb = UInt64(f[1]) else { continue }
-        let path = String(f[2])
+    for i in 0..<min(n, pids.count) {
+        let pid = pids[i]
+        if pid <= 0 { continue }
+        var bsd = proc_bsdinfo()
+        let bsdSize = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, bsdSize) == bsdSize, bsd.pbi_uid == uid else { continue }
+        var ti = proc_taskinfo()
+        let tiSize = Int32(MemoryLayout<proc_taskinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &ti, tiSize) == tiSize else { continue }
+        guard proc_pidpath(pid, &pathBuf, UInt32(pathBuf.count)) > 0 else { continue }
+        let path = String(cString: pathBuf)
         let name = groupName(path)
         var appPath: String? = nil
         if !path.contains("/claude-code/"), let r = path.range(of: ".app/") { appPath = String(path[..<r.lowerBound]) + ".app" }
         var g = map[name] ?? ProcGroup(id: name, name: name, bytes: 0, pids: [], isApp: appPath != nil, appPath: appPath)
-        g.bytes += kb * 1024
+        g.bytes += ti.pti_resident_size
         g.pids.append(pid)
         map[name] = g
     }
