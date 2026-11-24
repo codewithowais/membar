@@ -76,8 +76,16 @@ final class Model: ObservableObject {
     @Published var diskMessage: String? = nil
     var diskScanAt: Date? = nil
 
+    @Published var diskScanDone = 0
+    @Published var diskScanTotal = 0
+    private var diskCache: [String: [DiskItem]] = DiskCache.load()
+    private var scanTask: Task<Void, Never>?
+    private var scanID = 0
+
     func openDisk(_ path: String) {
         diskPath = path
+        // Show what we already know straight away; the rescan then refreshes it in the background.
+        diskItems = (diskCache[path] ?? []).map { var i = $0; i.pending = i.isDir; return i }
         scanDisk()
     }
 
@@ -86,18 +94,68 @@ final class Model: ObservableObject {
         openDisk((diskPath as NSString).deletingLastPathComponent)
     }
 
+    /// Lists the folder instantly, then measures sub-folders three at a time. Every result shows up
+    /// the moment it is ready, so you never stare at an empty screen.
     func scanDisk() {
-        diskScanning = true
+        scanTask?.cancel()
+        scanID += 1
+        let id = scanID
         let path = diskPath
-        Task.detached {
-            let d = readDisk()
-            await MainActor.run { self.diskTotal = d.total; self.diskAvail = d.avail }
-            let items = listDir(path)
+        let cached = diskCache[path] ?? []
+        diskScanning = true
+        diskScanDone = 0
+        diskScanTotal = 0
+        scanTask = Task.detached(priority: .utility) { [weak self] in
+            let disk = readDisk()
+            var items = quickList(path)
+            // Show last time's sizes (dimmed) while the fresh ones are calculated.
+            let old = Dictionary(cached.map { ($0.path, $0.bytes) }, uniquingKeysWith: { a, _ in a })
+            for i in items.indices where items[i].pending { items[i].bytes = old[items[i].path] ?? 0 }
+            items = sortedItems(items)
+            let todo = items.filter { $0.pending }.sorted { $0.bytes < $1.bytes }.map(\.path)
+            let snapshot = items
             await MainActor.run {
-                if self.diskPath == path { self.diskItems = items; self.diskScanAt = Date() }
-                self.diskScanning = false
+                guard let self, self.scanID == id else { return }
+                self.diskTotal = disk.total; self.diskAvail = disk.avail
+                self.diskItems = snapshot
+                self.diskScanTotal = todo.count
             }
+            await withTaskGroup(of: (String, UInt64?).self) { group in
+                var next = 0
+                while next < min(3, todo.count) {
+                    let p = todo[next]; next += 1
+                    group.addTask { (p, await duSize(p)) }
+                }
+                while let (p, size) = await group.next() {
+                    if Task.isCancelled { group.cancelAll(); break }
+                    await MainActor.run { self?.applySize(scanID: id, itemPath: p, bytes: size) }
+                    if next < todo.count {
+                        let q = todo[next]; next += 1
+                        group.addTask { (q, await duSize(q)) }
+                    }
+                }
+            }
+            if Task.isCancelled { return }
+            await MainActor.run { self?.finishScan(id: id, path: path) }
         }
+    }
+
+    private func applySize(scanID id: Int, itemPath: String, bytes: UInt64?) {
+        guard scanID == id, let idx = diskItems.firstIndex(where: { $0.path == itemPath }) else { return }
+        var it = diskItems[idx]
+        if let b = bytes { it.bytes = b }
+        it.pending = false
+        diskItems[idx] = it
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) { diskItems = sortedItems(diskItems) }
+        diskScanDone += 1
+    }
+
+    private func finishScan(id: Int, path: String) {
+        guard scanID == id else { return }
+        diskScanning = false
+        diskScanAt = Date()
+        diskCache[path] = diskItems.map { var i = $0; i.pending = false; return i }
+        DiskCache.save(diskCache)
     }
 
     func trash(_ it: DiskItem) {

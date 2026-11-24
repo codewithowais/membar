@@ -803,8 +803,14 @@ struct DiskRow: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                Text(fmtDisk(it.bytes)).font(.callout.weight(.medium)).monospacedDigit().foregroundStyle(.secondary)
-                    .frame(width: 72, alignment: .trailing)
+                HStack(spacing: 4) {
+                    if it.pending { ProgressView().controlSize(.mini) }
+                    if !(it.pending && it.bytes == 0) {
+                        Text(fmtDisk(it.bytes)).font(.callout.weight(.medium)).monospacedDigit().foregroundStyle(.secondary)
+                            .opacity(it.pending ? 0.55 : 1)
+                    }
+                }
+                .frame(width: 84, alignment: .trailing)
                 PillButton(systemImage: "magnifyingglass") {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: it.path)])
                 }
@@ -821,6 +827,13 @@ struct DiskView: View {
     @EnvironmentObject var model: Model
 
     var shortPath: String { model.diskPath.replacingOccurrences(of: NSHomeDirectory(), with: "~") }
+
+    var statusText: String {
+        if model.diskScanning {
+            return model.diskScanTotal > 0 ? "measuring \(model.diskScanDone)/\(model.diskScanTotal) folders…" : "listing…"
+        }
+        return "\(model.diskItems.count) items"
+    }
 
     var body: some View {
         let used = model.diskTotal > model.diskAvail ? model.diskTotal - model.diskAvail : 0
@@ -850,12 +863,10 @@ struct DiskView: View {
                     PillButton(systemImage: "arrow.clockwise") { model.scanDisk() }.disabled(model.diskScanning)
                 }
             }
-            SectionHeader(title: shortPath, trailing: model.diskScanning && model.diskItems.isEmpty ? "scanning…" : "\(model.diskItems.count) items", upper: false)
-            if model.diskScanning && !model.diskItems.isEmpty {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text("Refreshing…").font(.caption2).foregroundStyle(.secondary)
-                }
+            SectionHeader(title: shortPath, trailing: statusText, upper: false)
+            if model.diskScanning && model.diskScanTotal > 0 {
+                UsageBar(fraction: Double(model.diskScanDone) / Double(max(model.diskScanTotal, 1)), tint: .accentColor, height: 3)
+                    .padding(.horizontal, 8)
             } else if !model.diskScanning && model.diskItems.isEmpty {
                 Text("Nothing found here, or macOS blocked access. Allow MemBar in Privacy & Security → Files and Folders.")
                     .font(.caption2).foregroundStyle(.orange)
@@ -876,7 +887,10 @@ struct DiskView: View {
             if let m = model.diskMessage { Text(m).font(.caption2).foregroundStyle(.orange) }
         }
         .onAppear {
-            if !model.diskScanning && model.mem.pressure < 0.92 && (model.diskItems.isEmpty || Date().timeIntervalSince(model.diskScanAt ?? .distantPast) > 120) {
+            if model.diskItems.isEmpty && !model.diskScanning {
+                model.openDisk(model.diskPath)     // cached results first, then a fresh scan
+            } else if !model.diskScanning && model.mem.pressure < 0.92
+                        && Date().timeIntervalSince(model.diskScanAt ?? .distantPast) > 120 {
                 model.scanDisk()
             }
         }
