@@ -6,6 +6,7 @@ struct MemBarApp: App {
 
     init() {
         setpriority(PRIO_PROCESS, 0, 10)   // lower CPU priority than the apps you are using
+        setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_THROTTLE)   // and throttled disk access
         DebugLog.install()
     }
 
@@ -69,7 +70,7 @@ struct AuroraBackground: View {
     var active = true
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 12, paused: !active)) { ctx in
+        TimelineView(.animation(minimumInterval: 1.0 / 8, paused: !active)) { ctx in
             let t = ctx.date.timeIntervalSinceReferenceDate
             Canvas { gc, size in
                 let w = size.width, h = size.height
@@ -152,6 +153,7 @@ struct PillButton: View {
     var systemImage: String? = nil
     var destructive = false
     var tint: Color? = nil
+    var loading = false
     let action: () -> Void
     @State private var hover = false
     @Environment(\.isEnabled) private var enabled
@@ -159,19 +161,26 @@ struct PillButton: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 5) {
-                if let s = systemImage { Image(systemName: s) }
-                if !title.isEmpty { Text(title) }
+                if loading {
+                    ProgressView().controlSize(.mini).frame(width: 14, height: 14)
+                } else {
+                    if let s = systemImage { Image(systemName: s) }
+                    if !title.isEmpty { Text(title) }
+                }
             }
             .font(.caption.weight(.semibold))
             .padding(.horizontal, 11).padding(.vertical, 6)
+            .frame(minWidth: title.isEmpty ? nil : 52)
             .foregroundStyle(tint != nil ? Color.white : (destructive && hover ? Color.red : Color.primary))
-            .glass(Capsule(), tint: tint ?? (destructive && hover ? Color.red.opacity(0.45) : nil))
-            .scaleEffect(hover && enabled ? 1.07 : 1)
+            .glass(Capsule(), tint: tint ?? (destructive && (hover || loading) ? Color.red.opacity(0.45) : nil))
+            .scaleEffect(hover && enabled && !loading ? 1.07 : 1)
             .animation(.spring(response: 0.25, dampingFraction: 0.65), value: hover)
             .opacity(enabled ? 1 : 0.4)
         }
         .buttonStyle(.plain)
+        .disabled(loading)
         .onHover { hover = $0 }
+        .help(loading ? "Working…" : "")
     }
 }
 
@@ -191,13 +200,20 @@ struct HoverRow<Content: View>: View {
 }
 
 enum IconCache {
-    static var cache: [String: NSImage] = [:]
+    private static let cache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        c.countLimit = 60            // the system also evicts these under memory pressure
+        return c
+    }()
+
     static func icon(_ path: String) -> NSImage {
-        if let i = cache[path] { return i }
+        if let i = cache.object(forKey: path as NSString) { return i }
         let i = NSWorkspace.shared.icon(forFile: path)
-        cache[path] = i
+        cache.setObject(i, forKey: path as NSString)
         return i
     }
+
+    static func clear() { cache.removeAllObjects() }
 }
 
 func Stat(_ big: String, _ small: String) -> some View {
@@ -440,6 +456,7 @@ struct ContentView: View {
 struct RamRow: View {
     let g: ProcGroup
     let maxBytes: UInt64
+    var busy = false
     let onQuit: () -> Void
 
     var caption: String {
@@ -464,7 +481,7 @@ struct RamRow: View {
                 }
                 Text(fmt(g.bytes)).font(.callout.weight(.medium)).monospacedDigit().foregroundStyle(.secondary)
                     .frame(width: 72, alignment: .trailing)
-                PillButton(title: "Quit", destructive: true, action: onQuit)
+                PillButton(title: "Quit", destructive: true, loading: busy, action: onQuit)
                     .disabled(protectedNames.contains(g.name))
             }
         }
@@ -534,7 +551,7 @@ struct MemoryView: View {
             ScrollView {
                 LazyVStack(spacing: 2) {
                     ForEach(rows.prefix(40)) { g in
-                        RamRow(g: g, maxBytes: model.groups.first?.bytes ?? 1) { model.quit(g) }
+                        RamRow(g: g, maxBytes: model.groups.first?.bytes ?? 1, busy: model.busy.contains("q:" + g.id)) { model.quit(g) }
                     }
                 }
             }
@@ -609,6 +626,7 @@ struct MemChip: View {
 struct TabRow: View {
     let t: ChromeTab
     let maxMem: UInt64
+    var busy = false
     let onClose: () -> Void
 
     var body: some View {
@@ -627,7 +645,7 @@ struct TabRow: View {
                 }
                 Spacer(minLength: 6)
                 MemChip(mem: t.mem, measured: t.measured)
-                PillButton(systemImage: "xmark", destructive: true, action: onClose).help("Close tab")
+                PillButton(systemImage: "xmark", destructive: true, loading: busy, action: onClose)
             }
         }
     }
@@ -708,7 +726,7 @@ struct ChromeView: View {
             ScrollView {
                 LazyVStack(spacing: 2) {
                     ForEach(rows) { t in
-                        TabRow(t: t, maxMem: maxMem) { withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) { model.close(t) } }
+                        TabRow(t: t, maxMem: maxMem, busy: model.busy.contains("c:" + t.id)) { model.close(t) }
                     }
                 }
                 .animation(.spring(response: 0.4, dampingFraction: 0.85), value: rows.map(\.id))
@@ -765,9 +783,12 @@ struct CleanView: View {
                     .glass(Capsule(), tint: Color.green.opacity(0.25))
             }
             Spacer()
-            let canClean = !model.scanning && model.items.contains { $0.selected && ($0.size > 0 || $0.id == "trash") }
+            let canClean = !model.scanning && !model.cleaning && model.items.contains { $0.selected && ($0.size > 0 || $0.id == "trash") }
             Button { model.clean() } label: {
-                Label("Clean selected", systemImage: "wand.and.stars")
+                HStack(spacing: 8) {
+                    if model.cleaning { ProgressView().controlSize(.small) } else { Image(systemName: "wand.and.stars") }
+                    Text(model.cleaning ? "Cleaning…" : "Clean selected")
+                }
                     .font(.headline).foregroundStyle(.white)
                     .frame(maxWidth: .infinity).padding(.vertical, 12)
                     .glass(Capsule(), tint: Color.green.opacity(0.7))
@@ -785,6 +806,7 @@ struct CleanView: View {
 struct DiskRow: View {
     let it: DiskItem
     let maxBytes: UInt64
+    var busy = false
     let open: () -> Void
     let trash: () -> Void
 
@@ -816,7 +838,7 @@ struct DiskRow: View {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: it.path)])
                 }
                 .help("Show in Finder")
-                PillButton(systemImage: "trash", destructive: true, action: trash)
+                PillButton(systemImage: "trash", destructive: true, loading: busy, action: trash)
                     .disabled(!canTrash(it.path))
                     .help("Move to Trash")
             }
@@ -877,8 +899,8 @@ struct DiskView: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 2) {
-                        ForEach(model.diskItems) { it in
-                            DiskRow(it: it, maxBytes: model.diskItems.first?.bytes ?? 1,
+                        ForEach(model.diskItems.prefix(200)) { it in
+                            DiskRow(it: it, maxBytes: model.diskItems.first?.bytes ?? 1, busy: model.busy.contains("t:" + it.path),
                                     open: { if it.isDir { model.openDisk(it.path) } },
                                     trash: { model.trash(it) })
                         }

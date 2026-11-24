@@ -49,30 +49,50 @@ func sortedItems(_ items: [DiskItem]) -> [DiskItem] {
     }
 }
 
-/// Size of one folder via `du -sk`. Runs at background priority and the `du` process is killed
-/// if the surrounding task is cancelled (for example when you open another folder).
-func duSize(_ path: String) async -> UInt64? {
+/// Runs `du` at background priority and returns its output. The process is killed if the
+/// surrounding task is cancelled (for example when you open another folder).
+private func duOutput(_ args: [String]) async -> String {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/du")
-    p.arguments = ["-sk", "-I", "*.photoslibrary", "-I", "*.musiclibrary", "-I", "*.tvlibrary", path]
+    p.arguments = args
     p.qualityOfService = .background
     let pipe = Pipe()
     p.standardOutput = pipe
     p.standardError = Pipe()
     return await withTaskCancellationHandler {
-        await withCheckedContinuation { (cont: CheckedContinuation<UInt64?, Never>) in
+        await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
             DispatchQueue.global(qos: .background).async {
-                do { try p.run() } catch { cont.resume(returning: nil); return }
+                do { try p.run() } catch { cont.resume(returning: ""); return }
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 p.waitUntilExit()
-                let text = String(data: data, encoding: .utf8) ?? ""
-                if let kb = text.split(separator: "\t").first.flatMap({ UInt64($0) }) { cont.resume(returning: kb * 1024) }
-                else { cont.resume(returning: nil) }
+                cont.resume(returning: String(data: data, encoding: .utf8) ?? "")
             }
         }
     } onCancel: {
         if p.isRunning { p.terminate() }
     }
+}
+
+private let duSkips = ["-I", "*.photoslibrary", "-I", "*.musiclibrary", "-I", "*.tvlibrary"]
+
+/// Size of one folder via `du -sk`.
+func duSize(_ path: String) async -> UInt64? {
+    let text = await duOutput(["-sk"] + duSkips + [path])
+    return text.split(separator: "\t").first.flatMap { UInt64($0) }.map { $0 * 1024 }
+}
+
+/// Sizes of every direct child in ONE `du` pass. Far lighter than one process per child when a folder
+/// has thousands of sub-folders (think node_modules).
+func duChildren(_ parent: String) async -> [String: UInt64] {
+    let text = await duOutput(["-k", "-d", "1"] + duSkips + [parent])
+    var out: [String: UInt64] = [:]
+    for line in text.split(separator: "\n") {
+        let f = line.split(separator: "\t", maxSplits: 1)
+        guard f.count == 2, let kb = UInt64(f[0]) else { continue }
+        let path = String(f[1])
+        if path != parent && path != parent + "/" { out[path] = kb * 1024 }
+    }
+    return out
 }
 
 // MARK: - Cache (so a folder you have seen before opens instantly)

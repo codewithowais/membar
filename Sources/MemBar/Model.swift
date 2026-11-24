@@ -12,6 +12,9 @@ final class Model: ObservableObject {
     @Published var lastFreed: UInt64? = nil
     /// True while the panel is open (MemBar is the active app). Everything heavy is gated on this.
     @Published var panelOpen = false
+    /// Keys of actions in progress ("q:<app>" quit, "t:<path>" delete, "c:<tab>" close tab); buttons show a loader.
+    @Published var busy: Set<String> = []
+    @Published var cleaning = false
 
     /// Not @Published on purpose: appending to it must not re-render the UI while the panel is closed.
     var memHistory: [Double] = []
@@ -24,7 +27,7 @@ final class Model: ObservableObject {
             Task { @MainActor in self?.panelOpen = true; self?.refresh() }
         }
         nc.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.panelOpen = false }
+            Task { @MainActor in self?.panelOpen = false; self?.releaseWhenClosed() }
         }
         // Belt and braces: the panel is also "open" whenever one of our own windows is key.
         nc.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { [weak self] n in
@@ -38,10 +41,16 @@ final class Model: ObservableObject {
             Task { @MainActor in self?.panelOpen = false }
         }
         sampleMemory()
-        timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
         timer?.tolerance = 2   // lets macOS batch our wake-ups with others
+    }
+
+    /// Free what only the open panel needs (icons for 40 rows etc.) so MemBar stays small while idle.
+    private func releaseWhenClosed() {
+        if !groups.isEmpty { groups = [] }
+        IconCache.clear()
     }
 
     /// Cheap (a couple of syscalls, no process spawned). Runs always, to feed the menu bar number and the graph.
@@ -120,18 +129,25 @@ final class Model: ObservableObject {
                 self.diskItems = snapshot
                 self.diskScanTotal = todo.count
             }
-            await withTaskGroup(of: (String, UInt64?).self) { group in
-                var next = 0
-                while next < min(3, todo.count) {
-                    let p = todo[next]; next += 1
-                    group.addTask { (p, await duSize(p)) }
-                }
-                while let (p, size) = await group.next() {
-                    if Task.isCancelled { group.cancelAll(); break }
-                    await MainActor.run { self?.applySize(scanID: id, itemPath: p, bytes: size) }
-                    if next < todo.count {
-                        let q = todo[next]; next += 1
-                        group.addTask { (q, await duSize(q)) }
+            if todo.count > 120 {
+                // Huge folder (thousands of sub-folders): one `du` pass is far lighter than a process per folder.
+                let sizes = await duChildren(path)
+                if Task.isCancelled { return }
+                await MainActor.run { self?.applyBatch(scanID: id, sizes: sizes) }
+            } else {
+                await withTaskGroup(of: (String, UInt64?).self) { group in
+                    var next = 0
+                    while next < min(2, todo.count) {
+                        let p = todo[next]; next += 1
+                        group.addTask { (p, await duSize(p)) }
+                    }
+                    while let (p, size) = await group.next() {
+                        if Task.isCancelled { group.cancelAll(); break }
+                        await MainActor.run { self?.applySize(scanID: id, itemPath: p, bytes: size) }
+                        if next < todo.count {
+                            let q = todo[next]; next += 1
+                            group.addTask { (q, await duSize(q)) }
+                        }
                     }
                 }
             }
@@ -148,6 +164,16 @@ final class Model: ObservableObject {
         diskItems[idx] = it
         withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) { diskItems = sortedItems(diskItems) }
         diskScanDone += 1
+    }
+
+    private func applyBatch(scanID id: Int, sizes: [String: UInt64]) {
+        guard scanID == id else { return }
+        for i in diskItems.indices where diskItems[i].pending {
+            if let b = sizes[diskItems[i].path] { diskItems[i].bytes = b }
+            diskItems[i].pending = false
+        }
+        diskScanDone = diskScanTotal
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) { diskItems = sortedItems(diskItems) }
     }
 
     private func finishScan(id: Int, path: String) {
@@ -170,12 +196,23 @@ final class Model: ObservableObject {
         a.addButton(withTitle: "Move to Trash")
         a.addButton(withTitle: "Cancel")
         guard a.runModal() == .alertFirstButtonReturn else { return }
-        do {
-            try FileManager.default.trashItem(at: URL(fileURLWithPath: it.path), resultingItemURL: nil)
-            diskItems.removeAll { $0.path == it.path }
-            diskMessage = "Moved \(it.name) to Trash. Empty the Trash (Clean tab) to get the space back."
-        } catch {
-            diskMessage = "Could not delete \(it.name): \(error.localizedDescription)"
+        let key = "t:" + it.path
+        busy.insert(key)
+        Task.detached(priority: .utility) { [weak self] in
+            let err: String? = {
+                do { try FileManager.default.trashItem(at: URL(fileURLWithPath: it.path), resultingItemURL: nil); return nil }
+                catch { return error.localizedDescription }
+            }()
+            await MainActor.run {
+                guard let self else { return }
+                self.busy.remove(key)
+                if let err {
+                    self.diskMessage = "Could not delete \(it.name): \(err)"
+                } else {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { self.diskItems.removeAll { $0.path == it.path } }
+                    self.diskMessage = "Moved \(it.name) to Trash. Empty the Trash (Clean tab) to get the space back."
+                }
+            }
         }
     }
 
@@ -206,13 +243,45 @@ final class Model: ObservableObject {
     }
 
     func close(_ t: ChromeTab) {
-        tabs.removeAll { $0.id == t.id }
-        Task.detached { closeChromeTab(t); await MainActor.run { self.refreshTabs() } }
+        let key = "c:" + t.id
+        guard !busy.contains(key) else { return }
+        busy.insert(key)
+        Task.detached(priority: .utility) { [weak self] in
+            closeChromeTab(t)
+            await MainActor.run {
+                self?.busy.remove(key)
+                self?.tabs.removeAll { $0.id == t.id }
+                self?.refreshTabs()
+            }
+        }
     }
 
+    /// Asks the app to quit, shows a loader on its button until it is really gone, and offers a force quit if it refuses.
     func quit(_ g: ProcGroup) {
+        let key = "q:" + g.id
+        guard !busy.contains(key) else { return }
+        busy.insert(key)
         MemBar.quit(g)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.refresh() }
+        Task { @MainActor in
+            for _ in 0..<8 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                if g.pids.allSatisfy({ kill($0, 0) != 0 }) { break }
+            }
+            busy.remove(key)
+            refresh()
+            let alive = g.pids.filter { kill($0, 0) == 0 }
+            guard g.isApp, !alive.isEmpty else { return }
+            let a = NSAlert()
+            a.messageText = "\(g.name) did not quit"
+            a.informativeText = "It may be showing a dialog or saving. Force quitting can lose unsaved work."
+            a.addButton(withTitle: "Force quit")
+            a.addButton(withTitle: "Cancel")
+            if a.runModal() == .alertFirstButtonReturn {
+                for pid in alive { kill(pid, SIGKILL) }
+                try? await Task.sleep(nanoseconds: 800_000_000)
+                refresh()
+            }
+        }
     }
 
     func scan() {
@@ -235,11 +304,11 @@ final class Model: ObservableObject {
         alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        scanning = true
-        Task.detached {
+        cleaning = true
+        Task.detached(priority: .utility) {
             var freed: UInt64 = 0
             for i in sel { if i.id == "trash" { emptyTrashViaFinder() } else { freed += clearContents(of: i.url) } }
-            await MainActor.run { self.lastFreed = freed; self.scan() }
+            await MainActor.run { self.cleaning = false; self.lastFreed = freed; self.scan() }
         }
     }
 }
