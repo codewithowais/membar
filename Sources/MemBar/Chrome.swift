@@ -6,12 +6,29 @@ struct ChromeTab: Identifiable {
     let windowID: String
     let tabID: String
     let title: String
-    let url: String
+    let url: String          // real page URL (unwrapped from tab-suspender pages)
+    let host: String
+    let favicon: NSImage?
     var mem: UInt64? = nil      // memory of the renderer process hosting this tab
     var pid: Int32? = nil
     var shared: Int = 1         // how many tabs share that process
     var measured = false
-    var host: String { URL(string: url)?.host ?? url }
+
+    init(id: String, windowID: String, tabID: String, title: String, url rawURL: String) {
+        self.id = id; self.windowID = windowID; self.tabID = tabID; self.title = title
+        var real = rawURL
+        var icon: NSImage? = nil
+        // Tab-suspender extensions park tabs on chrome-extension://…/park.html?url=<real url>&icon=<data uri>
+        if rawURL.hasPrefix("chrome-extension://"), let c = URLComponents(string: rawURL) {
+            if let u = c.queryItems?.first(where: { $0.name == "url" })?.value { real = u }
+            if let i = c.queryItems?.first(where: { $0.name == "icon" })?.value,
+               let r = i.range(of: "base64,"),
+               let d = Data(base64Encoded: String(i[r.upperBound...])) { icon = NSImage(data: d) }
+        }
+        self.url = real
+        self.host = URL(string: real)?.host ?? real
+        self.favicon = icon
+    }
 }
 
 /// Opens Chrome's own Task Manager, reads which process each tab runs in, closes it,

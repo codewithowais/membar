@@ -244,6 +244,92 @@ struct Ring: View {
     }
 }
 
+struct SectionHeader: View {
+    let title: String
+    let trailing: String
+    var upper = true
+
+    var body: some View {
+        HStack {
+            Text(upper ? title.uppercased() : title)
+                .font(.caption2.weight(.semibold)).tracking(upper ? 0.8 : 0)
+                .foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
+            Spacer()
+            Text(trailing).font(.caption2).foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 8)
+    }
+}
+
+struct SkeletonRows: View {
+    let count: Int
+    @State private var on = false
+
+    var body: some View {
+        VStack(spacing: 14) {
+            ForEach(0..<count, id: \.self) { i in
+                HStack(spacing: 11) {
+                    RoundedRectangle(cornerRadius: 8).frame(width: 26, height: 26)
+                    VStack(alignment: .leading, spacing: 6) {
+                        RoundedRectangle(cornerRadius: 4).frame(width: CGFloat(120 + (i * 37) % 90), height: 10)
+                        RoundedRectangle(cornerRadius: 3).frame(width: 70, height: 6)
+                    }
+                    Spacer()
+                    Capsule().frame(width: 52, height: 10)
+                }
+                .foregroundStyle(Color.primary.opacity(on ? 0.16 : 0.06))
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.top, 6)
+        .onAppear { withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { on = true } }
+    }
+}
+
+/// Memory pressure over the last few minutes.
+struct Sparkline: View {
+    let values: [Double]
+    let color: Color
+
+    var body: some View {
+        GeometryReader { g in
+            let pts = points(in: g.size)
+            if pts.count > 2 {
+                ZStack {
+                    Path { p in
+                        p.move(to: CGPoint(x: pts[0].x, y: g.size.height))
+                        pts.forEach { p.addLine(to: $0) }
+                        p.addLine(to: CGPoint(x: pts[pts.count - 1].x, y: g.size.height))
+                        p.closeSubpath()
+                    }
+                    .fill(LinearGradient(colors: [color.opacity(0.35), color.opacity(0)], startPoint: .top, endPoint: .bottom))
+                    Path { p in
+                        p.move(to: pts[0])
+                        pts.dropFirst().forEach { p.addLine(to: $0) }
+                    }
+                    .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                    Circle().fill(color).frame(width: 7, height: 7).position(pts[pts.count - 1])
+                        .shadow(color: color, radius: 4)
+                }
+            } else {
+                Text("collecting data…").font(.caption2).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    private func points(in size: CGSize) -> [CGPoint] {
+        guard values.count > 1 else { return [] }
+        let lo = max(0, (values.min() ?? 0) - 0.03)
+        let hi = min(1, (values.max() ?? 1) + 0.03)
+        let span = max(hi - lo, 0.02)
+        return values.enumerated().map { i, v in
+            CGPoint(x: size.width * CGFloat(i) / CGFloat(values.count - 1),
+                    y: size.height * (1 - CGFloat((v - lo) / span)))
+        }
+    }
+}
+
 // MARK: - Root
 
 enum Tab: String, CaseIterable {
@@ -297,7 +383,8 @@ struct GlassTabBar: View {
 
 struct ContentView: View {
     @EnvironmentObject var model: Model
-    @State private var tab: Tab = .memory
+    @AppStorage("membar.tab") private var tabRaw: String = Tab.memory.rawValue
+    var tab: Tab { Tab(rawValue: tabRaw) ?? .memory }
 
     var auroraColors: [Color] {
         switch tab {
@@ -312,7 +399,7 @@ struct ContentView: View {
         ZStack {
             AuroraBackground(colors: auroraColors)
             VStack(spacing: 12) {
-                GlassTabBar(tab: $tab)
+                GlassTabBar(tab: Binding(get: { tab }, set: { tabRaw = $0.rawValue }))
                 Group {
                     switch tab {
                     case .memory: MemoryView()
@@ -326,12 +413,13 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
                 HStack {
-                    Label("MemBar", systemImage: "memorychip").font(.caption2).foregroundStyle(.secondary)
+                    Label("MemBar 1.1", systemImage: "memorychip").font(.caption2).foregroundStyle(.secondary)
                     Spacer()
                     PillButton(title: "Quit MemBar") { NSApplication.shared.terminate(nil) }
                 }
             }
             .padding(14)
+            .frame(maxHeight: .infinity, alignment: .top)
         }
         .frame(width: 420, height: 620)
         .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
@@ -376,6 +464,7 @@ struct RamRow: View {
 
 struct RamHeader: View {
     let m: MemInfo
+    let history: [Double]
 
     var status: (String, String, Color) {
         if m.pressure > 0.9 { return ("Almost full", "exclamationmark.triangle.fill", .red) }
@@ -386,6 +475,7 @@ struct RamHeader: View {
     var body: some View {
         let s = status
         Card {
+            VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 16) {
                 Ring(fraction: m.pressure, color: levelColor(m.pressure),
                      value: String(format: "%.1f", Double(m.used) / 1_073_741_824),
@@ -400,6 +490,13 @@ struct RamHeader: View {
                     }
                 }
                 Spacer(minLength: 0)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("MEMORY USE · LAST \(max(1, history.count * 4 / 60)) MIN")
+                    .font(.system(size: 9, weight: .semibold)).tracking(0.8).foregroundStyle(.secondary)
+                Sparkline(values: history, color: levelColor(m.pressure)).frame(height: 34)
+            }
+            .padding(.top, 4)
             }
         }
     }
@@ -422,8 +519,9 @@ struct MemoryView: View {
     var body: some View {
         let rows = model.groups.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }
         VStack(alignment: .leading, spacing: 10) {
-            RamHeader(m: model.mem)
+            RamHeader(m: model.mem, history: model.memHistory)
             SearchField(prompt: "Filter apps", text: $search)
+            SectionHeader(title: "Apps by memory", trailing: "\(rows.count) apps")
             ScrollView {
                 LazyVStack(spacing: 2) {
                     ForEach(rows.prefix(40)) { g in
@@ -450,7 +548,20 @@ func memColor(_ bytes: UInt64) -> Color {
 
 struct TabAvatar: View {
     let host: String
+    var icon: NSImage? = nil
     var body: some View {
+        if let icon {
+            Image(nsImage: icon).resizable().interpolation(.high).scaledToFit()
+                .padding(5)
+                .frame(width: 30, height: 30)
+                .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.white.opacity(0.92)))
+                .shadow(color: .black.opacity(0.15), radius: 3, y: 2)
+        } else {
+            letterAvatar
+        }
+    }
+
+    @ViewBuilder private var letterAvatar: some View {
         let clean = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
         let h = hostHue(clean)
         ZStack {
@@ -494,7 +605,7 @@ struct TabRow: View {
     var body: some View {
         HoverRow {
             HStack(spacing: 11) {
-                TabAvatar(host: t.host)
+                TabAvatar(host: t.host, icon: t.favicon)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(t.title.isEmpty ? t.host : t.title).lineLimit(1)
                     HStack(spacing: 6) {
@@ -584,6 +695,7 @@ struct ChromeView: View {
                 }
             }
             SearchField(prompt: "Filter tabs", text: $search)
+            SectionHeader(title: "Tabs by memory", trailing: "\(rows.count) tabs")
             ScrollView {
                 LazyVStack(spacing: 2) {
                     ForEach(rows) { t in
@@ -729,22 +841,26 @@ struct DiskView: View {
                     PillButton(systemImage: "arrow.clockwise") { model.scanDisk() }.disabled(model.diskScanning)
                 }
             }
-            Text(shortPath).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
-            if model.diskScanning {
+            SectionHeader(title: shortPath, trailing: model.diskScanning && model.diskItems.isEmpty ? "scanning…" : "\(model.diskItems.count) items", upper: false)
+            if model.diskScanning && !model.diskItems.isEmpty {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.small)
-                    Text("Scanning, big folders take a little while…").font(.caption2).foregroundStyle(.secondary)
+                    Text("Refreshing…").font(.caption2).foregroundStyle(.secondary)
                 }
-            } else if model.diskItems.isEmpty {
+            } else if !model.diskScanning && model.diskItems.isEmpty {
                 Text("Nothing found here, or macOS blocked access. Allow MemBar in Privacy & Security → Files and Folders.")
                     .font(.caption2).foregroundStyle(.orange)
             }
-            ScrollView {
-                LazyVStack(spacing: 2) {
-                    ForEach(model.diskItems) { it in
-                        DiskRow(it: it, maxBytes: model.diskItems.first?.bytes ?? 1,
-                                open: { if it.isDir { model.openDisk(it.path) } },
-                                trash: { model.trash(it) })
+            if model.diskScanning && model.diskItems.isEmpty {
+                SkeletonRows(count: 7).frame(maxHeight: .infinity, alignment: .top).clipped()
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        ForEach(model.diskItems) { it in
+                            DiskRow(it: it, maxBytes: model.diskItems.first?.bytes ?? 1,
+                                    open: { if it.isDir { model.openDisk(it.path) } },
+                                    trash: { model.trash(it) })
+                        }
                     }
                 }
             }

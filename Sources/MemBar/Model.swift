@@ -4,6 +4,7 @@ import AppKit
 @MainActor
 final class Model: ObservableObject {
     @Published var mem = MemInfo()
+    @Published var memHistory: [Double] = []
     @Published var groups: [ProcGroup] = []
     @Published var tabs: [ChromeTab] = []
     @Published var tabsError: String? = nil
@@ -25,7 +26,7 @@ final class Model: ObservableObject {
             let m = readMemory()
             let g = readProcGroups()
             let d = readDisk()
-            await MainActor.run { self.mem = m; self.groups = g; self.diskTotal = d.total; self.diskAvail = d.avail }
+            await MainActor.run { self.mem = m; self.groups = g; self.memHistory.append(m.pressure); if self.memHistory.count > 90 { self.memHistory.removeFirst() }; self.diskTotal = d.total; self.diskAvail = d.avail }
         }
     }
 
