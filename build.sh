@@ -20,5 +20,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>NSAppleEventsUsageDescription</key><string>MemBar lists and closes Chrome tabs.</string>
 </dict></plist>
 PLIST
-codesign --force --sign - "$APP"
+KC="$HOME/Library/Keychains/membar-signing.keychain-db"
+if [ -f "$KC" ]; then
+  # Stable signature (see setup-signing.sh) so macOS keeps your permission grants.
+  security unlock-keychain -p "" "$KC"
+  codesign --force --sign "MemBar Local Signing" --keychain "$KC" "$APP"
+else
+  codesign --force --sign - "$APP"
+fi
 echo "Built $APP"

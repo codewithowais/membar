@@ -243,30 +243,98 @@ struct Legend: View {
 
 // MARK: - Chrome
 
+func hostHue(_ s: String) -> Double {
+    var h = 0
+    for u in s.unicodeScalars { h = (h &* 31 &+ Int(u.value)) % 360 }
+    return Double(h) / 360
+}
+
+func memColor(_ bytes: UInt64) -> Color {
+    let mb = Double(bytes) / 1_048_576
+    return mb < 150 ? .green : mb < 400 ? .orange : .red
+}
+
+struct TabAvatar: View {
+    let host: String
+    var body: some View {
+        let clean = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        ZStack {
+            RoundedRectangle(cornerRadius: 7).fill(Color(hue: hostHue(clean), saturation: 0.55, brightness: 0.88))
+            Text(String(clean.first ?? "•").uppercased()).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundStyle(.white)
+        }
+        .frame(width: 28, height: 28)
+    }
+}
+
+struct MemChip: View {
+    let mem: UInt64?
+    let measured: Bool
+
+    var body: some View {
+        if let m = mem {
+            Text(fmt(m)).font(.callout.weight(.semibold)).monospacedDigit()
+                .foregroundStyle(memColor(m))
+                .padding(.horizontal, 9).padding(.vertical, 3)
+                .background(Capsule().fill(memColor(m).opacity(0.16)))
+        } else if measured {
+            Text("Suspended · 0 MB").font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(Capsule().fill(Color.primary.opacity(0.07)))
+        } else {
+            Text("—").font(.callout).foregroundStyle(.tertiary)
+        }
+    }
+}
+
 struct TabRow: View {
     let t: ChromeTab
+    let maxMem: UInt64
     let onClose: () -> Void
 
     var body: some View {
         HoverRow {
             HStack(spacing: 10) {
-                Image(systemName: "globe").foregroundStyle(.secondary).frame(width: 20)
-                VStack(alignment: .leading, spacing: 2) {
+                TabAvatar(host: t.host)
+                VStack(alignment: .leading, spacing: 3) {
                     Text(t.title.isEmpty ? t.host : t.title).lineLimit(1)
-                    Text(t.host).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    HStack(spacing: 6) {
+                        Text(t.host).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                        if t.shared > 1 { Text("· shared by \(t.shared) tabs").font(.caption2).foregroundStyle(.secondary) }
+                    }
+                    if let m = t.mem {
+                        UsageBar(fraction: Double(m) / Double(max(maxMem, 1)), tint: memColor(m), height: 3)
+                    }
                 }
                 Spacer(minLength: 6)
-                if let m = t.mem {
-                    VStack(alignment: .trailing, spacing: 1) {
-                        Text(fmt(m)).font(.callout.weight(.semibold)).monospacedDigit()
-                        if t.shared > 1 { Text("shared by \(t.shared)").font(.caption2).foregroundStyle(.secondary) }
-                    }
-                } else if t.measured {
-                    Text("suspended").font(.caption2).foregroundStyle(.secondary)
-                }
-                PillButton(title: "Close", destructive: true, action: onClose)
+                MemChip(mem: t.mem, measured: t.measured)
+                PillButton(systemImage: "xmark", destructive: true, action: onClose).help("Close tab")
             }
         }
+    }
+}
+
+struct ShareBar: View {
+    let tabs: [ChromeTab]
+
+    var body: some View {
+        // One segment per live process, sized by its share of the total.
+        var seen = Set<Int32>()
+        let parts = tabs.compactMap { t -> (String, UInt64)? in
+            guard let p = t.pid, let m = t.mem, seen.insert(p).inserted else { return nil }
+            return (t.host, m)
+        }.sorted { $0.1 > $1.1 }
+        let total = max(parts.reduce(UInt64(0)) { $0 + $1.1 }, 1)
+        return GeometryReader { g in
+            HStack(spacing: 2) {
+                ForEach(Array(parts.enumerated()), id: \.offset) { _, part in
+                    let clean = part.0.hasPrefix("www.") ? String(part.0.dropFirst(4)) : part.0
+                    Capsule().fill(Color(hue: hostHue(clean), saturation: 0.55, brightness: 0.88))
+                        .frame(width: max(4, (g.size.width - CGFloat(parts.count) * 2) * CGFloat(part.1) / CGFloat(total)))
+                }
+                if parts.isEmpty { Capsule().fill(Color.primary.opacity(0.10)) }
+            }
+        }
+        .frame(height: 8)
     }
 }
 
@@ -274,25 +342,47 @@ struct ChromeView: View {
     @EnvironmentObject var model: Model
     @State private var search = ""
 
+    var totalMem: UInt64 {
+        var seen = Set<Int32>()
+        var sum: UInt64 = 0
+        for t in model.tabs { if let p = t.pid, let m = t.mem, seen.insert(p).inserted { sum += m } }
+        return sum
+    }
+
     var body: some View {
+        let measured = model.tabs.contains { $0.measured }
         let live = model.tabs.filter { $0.mem != nil }.count
+        let suspended = model.tabs.filter { $0.measured && $0.mem == nil }.count
+        let maxMem = model.tabs.compactMap(\.mem).max() ?? 1
         let rows = model.tabs
             .filter { search.isEmpty || $0.title.localizedCaseInsensitiveContains(search) || $0.url.localizedCaseInsensitiveContains(search) }
             .sorted { ($0.mem ?? 0) > ($1.mem ?? 0) }
         VStack(alignment: .leading, spacing: 10) {
             Card {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 10) {
                     HStack(alignment: .firstTextBaseline) {
-                        Stat("\(model.tabs.count)", "open tabs")
+                        if measured { Stat(fmt(totalMem), "used by \(model.tabs.count) tabs") }
+                        else { Stat("\(model.tabs.count)", "open tabs") }
                         Spacer()
-                        if model.tabs.contains(where: { $0.measured }) {
-                            Text("\(live) using memory").font(.caption).foregroundStyle(.secondary)
+                    }
+                    if measured {
+                        ShareBar(tabs: model.tabs)
+                        HStack(spacing: 14) {
+                            Legend(color: .green, text: "\(live) active")
+                            Legend(color: .gray, text: "\(suspended) suspended")
                         }
                     }
                     HStack(spacing: 8) {
-                        PillButton(title: model.measuring ? "Measuring…" : "Measure memory", systemImage: "memorychip") { model.measureTabs() }
-                            .disabled(model.measuring)
+                        Button { model.measureTabs() } label: {
+                            Label(model.measuring ? "Measuring…" : "Measure every tab", systemImage: "memorychip")
+                        }
+                        .buttonStyle(.borderedProminent).controlSize(.small)
+                        .disabled(model.measuring)
                         PillButton(title: "Reload", systemImage: "arrow.clockwise") { model.refreshTabs() }
+                    }
+                    if !measured {
+                        Text("Tap Measure to see how many MB each tab uses. Suspended tabs show 0 MB.")
+                            .font(.caption2).foregroundStyle(.secondary)
                     }
                     if let e = model.tabsError { Text(e).font(.caption2).foregroundStyle(.orange) }
                 }
@@ -300,10 +390,13 @@ struct ChromeView: View {
             SearchField(prompt: "Filter tabs", text: $search)
             ScrollView {
                 LazyVStack(spacing: 2) {
-                    ForEach(rows) { t in TabRow(t: t) { model.close(t) } }
+                    ForEach(rows) { t in
+                        TabRow(t: t, maxMem: maxMem) { withAnimation(.easeInOut(duration: 0.2)) { model.close(t) } }
+                    }
                 }
+                .animation(.easeInOut(duration: 0.2), value: rows.map(\.id))
             }
-            Text("Measure memory briefly opens Chrome's Task Manager, so Chrome comes to the front and this panel closes. Reopen it to see the numbers.")
+            Text("Measuring briefly opens Chrome's Task Manager, so Chrome comes to the front and this panel closes. Reopen it to see the numbers.")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .onAppear { model.refreshTabs() }
