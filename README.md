@@ -9,7 +9,7 @@ A small macOS menu bar app that shows what is using your **RAM** and **disk**, a
 
 ## Build and run
 
-Requires macOS 13+ and Xcode / Swift 5.9+.
+Requires macOS 14+ (Liquid Glass on macOS 26+) and Xcode / Swift 5.9+.
 
 ```bash
 ./build.sh
